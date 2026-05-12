@@ -789,15 +789,15 @@ jobs:
             echo "KSU_LATEST_COMMIT_DATE=未知" >> $GITHUB_ENV
           fi
 
-      - name: 修复 SukiSU SUSFS 源码兼容
-        if: inputs.ksu_variant == 'SukiSU' && inputs.enable_susfs && inputs.ksu_variant != 'None'
+      - name: 修复 SukiSU/ReSukiSU SUSFS 源码兼容
+        if: (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'ReSukiSU') && inputs.enable_susfs && inputs.ksu_variant != 'None'
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
           set -euo pipefail
 
           KSU_C="KernelSU/kernel/ksu.c"
           if [ ! -f "$KSU_C" ]; then
-            echo "::error::未找到 $KSU_C，无法应用 SukiSU SUSFS 兼容修复"
+            echo "::error::未找到 $KSU_C，无法应用 SukiSU/ReSukiSU SUSFS 兼容修复"
             exit 1
           fi
 
@@ -842,7 +842,7 @@ jobs:
           ]
 
           if not missing_true and not missing_false:
-              print("SukiSU SUSFS static key definitions already exist.")
+              print("SukiSU/ReSukiSU SUSFS static key definitions already exist.")
           else:
               text = ksu_c.read_text()
               anchor = '#include "infra/kernel_compat.h"\n'
@@ -851,7 +851,7 @@ jobs:
 
               block = [
                   "",
-                  "/* ABK: SukiSU builtin SUSFS expects these inline hook static keys. */",
+                  "/* ABK: SukiSU/ReSukiSU builtin SUSFS expects these inline hook static keys. */",
                   "#ifdef CONFIG_KSU_SUSFS",
               ]
               block.extend(f"DEFINE_STATIC_KEY_TRUE({sym});" for sym in missing_true)
@@ -862,7 +862,7 @@ jobs:
               block.extend(["#endif", ""])
 
               ksu_c.write_text(text.replace(anchor, anchor + "\n".join(block), 1))
-              print("Injected missing SukiSU SUSFS static key definitions:", ", ".join(missing_true + missing_false))
+              print("Injected missing SukiSU/ReSukiSU SUSFS static key definitions:", ", ".join(missing_true + missing_false))
 
           sucompat_c = kernel_dir / "feature/sucompat.c"
           if sucompat_c.exists():
@@ -873,7 +873,7 @@ jobs:
                   before_marker = text.split(marker, 1)[0]
                   if preprocessor_delta(before_marker) > 0:
                       sucompat_c.write_text(text.replace(marker, "\n" + guard + marker, 1))
-                      print("Closed missing SukiSU builtin CONFIG_KSU_SUSFS block in feature/sucompat.c")
+                      print("Closed missing SukiSU/ReSukiSU builtin CONFIG_KSU_SUSFS block in feature/sucompat.c")
 
           sulog_event_c = kernel_dir / "sulog/event.c"
           if sulog_event_c.exists():
@@ -889,7 +889,7 @@ jobs:
               ])
               if old in text and "builtin SUSFS ksu_sulog_capture()" not in text:
                   sulog_event_c.write_text(text.replace(old, new, 1))
-                  print("Fixed SukiSU builtin sulog grant_root argv type for CONFIG_KSU_SUSFS")
+                  print("Fixed SukiSU/ReSukiSU builtin sulog grant_root argv type for CONFIG_KSU_SUSFS")
           PY
 
       - name: 配置 SukiSU 管理器信息
@@ -986,11 +986,11 @@ jobs:
           cd $KERNEL_ROOT/common
           patch -p1 < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch || true
 
-          if [ "${{ inputs.ksu_variant }}" == "SukiSU" ]; then
+          if [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "ReSukiSU" ]; then
             SUSFS_C="./fs/susfs.c"
             if [ -f "$SUSFS_C" ] && grep -q '^static void susfs_run_sus_path_loop(' "$SUSFS_C"; then
               sed -i 's/^static void susfs_run_sus_path_loop(/void susfs_run_sus_path_loop(/' "$SUSFS_C"
-              echo "已导出 susfs_run_sus_path_loop 供 SukiSU LSM hook 调用"
+              echo "已导出 susfs_run_sus_path_loop 供 SukiSU/ReSukiSU LSM hook 调用"
             fi
           fi
 
@@ -2521,13 +2521,13 @@ jobs:
             if grep -qF 'struct user_arg_ptr *argv_user' "$KSU_BUILD_DIR/sulog/event.c" \
               && grep -qF 'NULL, USER_ARG_NULL, gfp' "$KSU_BUILD_DIR/sulog/event.c" \
               && ! grep -qF 'builtin SUSFS ksu_sulog_capture() expects argv_user as a pointer' "$KSU_BUILD_DIR/sulog/event.c"; then
-              echo "::error::SukiSU sulog/event.c 仍存在 argv 参数类型不兼容调用: $KSU_BUILD_DIR/sulog/event.c"
+              echo "::error::SukiSU/ReSukiSU sulog/event.c 仍存在 argv 参数类型不兼容调用: $KSU_BUILD_DIR/sulog/event.c"
               exit 1
             fi
           fi
 
-      - name: 修复 SukiSU android16-6.12 源码兼容
-        if: inputs.ksu_variant == 'SukiSU' && inputs.android_version == 'android16' && inputs.kernel_version == '6.12'
+      - name: 修复 SukiSU/ReSukiSU android16-6.12 源码兼容
+        if: (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'ReSukiSU') && inputs.android_version == 'android16' && inputs.kernel_version == '6.12'
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
           set -euo pipefail
@@ -2541,7 +2541,7 @@ jobs:
           done
 
           if [ -z "$KSU_BUILD_DIR" ]; then
-            echo "::error::未找到实际 SukiSU 编译目录"
+            echo "::error::未找到实际 SukiSU/ReSukiSU 编译目录"
             exit 1
           fi
 
@@ -2607,7 +2607,7 @@ jobs:
                       print("已适配 android16-6.12 security_add_hooks() 的 struct lsm_id 参数")
 
           if not changed:
-              print("SukiSU android16-6.12 专项兼容修复无需修改。")
+              print("SukiSU/ReSukiSU android16-6.12 专项兼容修复无需修改。")
           PY
 
       - name: 编译内核
