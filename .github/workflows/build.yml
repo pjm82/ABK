@@ -1262,9 +1262,42 @@ jobs:
       - name: 应用 Kernel 特定补丁
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
-          # 修复 2024-11 分支: mmap.c 调用了 vm_flags_clear()，但同分支 mm.h 未提供 helper
-          if [[ "${{ inputs.os_patch_level }}" == "2024-11" ]] && grep -qF 'vm_flags_clear(new_vma, VM_PAD_MASK);' ./mm/mmap.c; then
-            sed -i 's/vm_flags_clear(new_vma, VM_PAD_MASK);/new_vma->vm_flags \&= ~VM_PAD_MASK;/' ./mm/mmap.c
+          # 修复 android15-6.6 2024-11: mmap.c 调用了 vm_flags_clear()，但同分支 mm.h 未提供 helper
+          if [[ "${{ inputs.android_version }}" == "android15" && "${{ inputs.kernel_version }}" == "6.6" && "${{ inputs.os_patch_level }}" == "2024-11" ]] \
+            && grep -qF 'vm_flags_clear(new_vma, VM_PAD_MASK);' ./mm/mmap.c \
+            && ! grep -qF 'static inline void vm_flags_clear(' ./include/linux/mm.h; then
+            python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("include/linux/mm.h")
+          text = path.read_text()
+          helper = """
+          static inline void vm_flags_clear(struct vm_area_struct *vma,
+                                            vm_flags_t flags)
+          {
+              vma_start_write(vma);
+              ACCESS_PRIVATE(vma, __vm_flags) &= ~flags;
+          }
+          """
+
+          if "static inline void vm_flags_clear(" not in text:
+              marker = "/*\n * Use only if VMA is not part of the VMA tree"
+              if marker in text:
+                  text = text.replace(marker, helper + "\n" + marker, 1)
+              else:
+                  needle = "static inline void vm_flags_set(struct vm_area_struct *vma,"
+                  start = text.find(needle)
+                  if start == -1:
+                      raise SystemExit("include/linux/mm.h missing vm_flags_set(), cannot inject vm_flags_clear()")
+                  body_start = text.find("{", start)
+                  body_end = text.find("\n}\n", body_start)
+                  if body_start == -1 or body_end == -1:
+                      raise SystemExit("include/linux/mm.h vm_flags_set() has unexpected format")
+                  insert_at = body_end + len("\n}\n")
+                  text = text[:insert_at] + helper + text[insert_at:]
+              path.write_text(text)
+          PY
+            echo "已为 android15-6.6 2024-11 补充 vm_flags_clear helper"
           fi
 
       - name: 备份基准 defconfig
