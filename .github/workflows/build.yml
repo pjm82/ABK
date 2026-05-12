@@ -1108,6 +1108,24 @@ jobs:
               echo "已修复 memory.c 缺少 susfs_def.h 问题"
             }
 
+            fix_selinux_extern_static() {
+              local file="./security/selinux/hooks.c"
+              if [ -f "$file" ] && grep -qF 'extern static int security_context_to_sid_with_policy' "$file"; then
+                sed -i 's/extern static int security_context_to_sid_with_policy/int security_context_to_sid_with_policy/' "$file"
+                echo "已修复 hooks.c 中 security_context_to_sid_with_policy 的 extern static 冲突"
+              fi
+
+              file="./security/selinux/selinuxfs.c"
+              if [ -f "$file" ] && grep -qF 'extern static int security_context_to_sid_with_policy' "$file"; then
+                sed -i 's/extern static int security_context_to_sid_with_policy/int security_context_to_sid_with_policy/' "$file"
+                echo "已修复 selinuxfs.c 中 security_context_to_sid_with_policy 的 extern static 冲突"
+              fi
+              if [ -f "$file" ] && grep -qF 'extern static int security_sid_to_context_with_policy' "$file"; then
+                sed -i 's/extern static int security_sid_to_context_with_policy/int security_sid_to_context_with_policy/' "$file"
+                echo "已修复 selinuxfs.c 中 security_sid_to_context_with_policy 的 extern static 冲突"
+              fi
+            }
+
             # Android 12 - 5.10 修复
             if [[ "${{ inputs.android_version }}" == "android12" && "${{ inputs.kernel_version }}" == "5.10" ]]; then
               if [[ "$CURRENT_SUB" -le 209 ]]; then
@@ -1196,6 +1214,9 @@ jobs:
 
             # Android 15 - 6.6 修复
             if [[ "${{ inputs.android_version }}" == "android15" && "${{ inputs.kernel_version }}" == "6.6" ]]; then
+              if [[ "${{ inputs.ksu_variant }}" == "Official" ]]; then
+                fix_selinux_extern_static
+              fi
               if [[ "$CURRENT_SUB" -ge 98 ]]; then
                 cp $KERNEL_PATCHES/wild/susfs_fix_patches/v${SUSFS_VERSION}/a15-6.6/base.c.patch ./
                 patch -p1 < base.c.patch || true
