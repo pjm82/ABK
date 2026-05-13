@@ -1,8 +1,10 @@
 package com.abk.kernel.utils
 
 import android.content.Context
+import com.topjohnwu.superuser.CallbackList
 import com.topjohnwu.superuser.Shell
 import java.io.File
+import java.util.Collections
 
 object RootUtils {
 
@@ -28,7 +30,11 @@ object RootUtils {
         }
     }
 
-    fun flashImage(imagePath: String, partition: String = "boot"): ShellResult {
+    fun flashImage(
+        imagePath: String,
+        partition: String = "boot",
+        onOutput: ((String) -> Unit)? = null
+    ): ShellResult {
         val safeImage = shellQuote(imagePath)
         val script = """
             set -e
@@ -62,10 +68,10 @@ object RootUtils {
             sync
             echo "[ABK] ${partition} 镜像刷写完成"
         """.trimIndent()
-        return execRootScript(script, timeoutSeconds = 240)
+        return execRootScript(script, timeoutSeconds = 240, onOutput = onOutput)
     }
 
-    fun installModule(zipPath: String): ShellResult {
+    fun installModule(zipPath: String, onOutput: ((String) -> Unit)? = null): ShellResult {
         val safeZip = shellQuote(zipPath)
         val script = """
             set -e
@@ -112,10 +118,75 @@ object RootUtils {
             sync
             echo "[ABK] 模块安装完成，通常需要重启后生效"
         """.trimIndent()
-        return execRootScript(script, timeoutSeconds = 240)
+        return execRootScript(script, timeoutSeconds = 240, onOutput = onOutput)
     }
 
-    fun flashAnyKernel3(context: Context, zipPath: String): ShellResult {
+    fun installApk(
+        context: Context,
+        apkPath: String,
+        onOutput: ((String) -> Unit)? = null
+    ): ShellResult {
+        val source = File(apkPath)
+        if (!source.isFile) {
+            val line = "APK 文件不存在: $apkPath"
+            onOutput?.invoke(line)
+            return ShellResult(false, listOf(line))
+        }
+
+        val stageDir = File(context.cacheDir, "manager-install").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        val stagedApk = File(stageDir, "manager-${System.currentTimeMillis()}.apk")
+        return try {
+            source.copyTo(stagedApk, overwrite = true)
+            val safeApk = shellQuote(stagedApk.absolutePath)
+            val script = """
+                echo "[ABK] 开始安装管理器 APK"
+                echo "[ABK] APK 原始路径: ${shellQuote(apkPath)}"
+                echo "[ABK] APK 暂存路径: $safeApk"
+                [ -f $safeApk ] || { echo "APK 暂存文件不存在"; exit 2; }
+                apk_size=${'$'}(wc -c < $safeApk 2>/dev/null || echo 0)
+                echo "[ABK] APK 大小: ${'$'}apk_size bytes"
+                tmp="/data/local/tmp/abk-manager-${'$'}$.apk"
+                rm -f "${'$'}tmp" 2>/dev/null || true
+                echo "[ABK] 复制 APK 到临时安装路径: ${'$'}tmp"
+                if ! cp $safeApk "${'$'}tmp" 2>/dev/null; then
+                    echo "[ABK] cp 复制失败，尝试 cat 复制"
+                    cat $safeApk > "${'$'}tmp" || { rc=${'$'}?; echo "[ABK] 复制 APK 失败: ${'$'}rc"; exit ${'$'}rc; }
+                fi
+                chmod 0644 "${'$'}tmp" || { rc=${'$'}?; echo "[ABK] chmod 失败: ${'$'}rc"; rm -f "${'$'}tmp" 2>/dev/null || true; exit ${'$'}rc; }
+                restorecon "${'$'}tmp" 2>/dev/null || true
+                ls -l "${'$'}tmp" 2>/dev/null || true
+                pm_bin="/system/bin/pm"
+                [ -x "${'$'}pm_bin" ] || pm_bin=${'$'}(command -v pm 2>/dev/null || true)
+                [ -n "${'$'}pm_bin" ] || { echo "未找到 pm 命令"; rm -f "${'$'}tmp" 2>/dev/null || true; exit 127; }
+                echo "[ABK] 执行 ${'$'}pm_bin install -r"
+                "${'$'}pm_bin" install -r "${'$'}tmp"
+                rc=${'$'}?
+                rm -f "${'$'}tmp" 2>/dev/null || true
+                if [ "${'$'}rc" -eq 0 ]; then
+                    echo "[ABK] 管理器 APK 安装完成"
+                else
+                    echo "[ABK] 管理器 APK 安装失败: ${'$'}rc"
+                fi
+                exit "${'$'}rc"
+            """.trimIndent()
+            execRootScript(script, timeoutSeconds = 240, onOutput = onOutput)
+        } catch (error: Exception) {
+            val line = error.message ?: error::class.java.simpleName
+            onOutput?.invoke(line)
+            ShellResult(false, listOf(line))
+        } finally {
+            stageDir.deleteRecursively()
+        }
+    }
+
+    fun flashAnyKernel3(
+        context: Context,
+        zipPath: String,
+        onOutput: ((String) -> Unit)? = null
+    ): ShellResult {
         val workDir = File(context.filesDir, "ak3-flash").apply {
             deleteRecursively()
             mkdirs()
@@ -124,14 +195,16 @@ object RootUtils {
         return try {
             scriptFile.writeText(AK3_FLASH_SCRIPT)
             val script = "F=${shellQuote(workDir.absolutePath)} Z=${shellQuote(zipPath)} /system/bin/sh ${shellQuote(scriptFile.absolutePath)}"
+            val output = rootOutputList(onOutput)
             val result = Shell.Builder.create()
                 .setFlags(Shell.FLAG_MOUNT_MASTER or Shell.FLAG_REDIRECT_STDERR)
                 .setTimeout(300L)
                 .build()
                 .newJob()
+                .to(output, output)
                 .add(script)
                 .exec()
-            ShellResult(result.isSuccess, result.out + result.err)
+            ShellResult(result.isSuccess, normalizedOutput(result.isSuccess, output, onOutput))
         } finally {
             workDir.deleteRecursively()
         }
@@ -176,24 +249,49 @@ object RootUtils {
 
     data class ShellResult(val success: Boolean, val output: List<String>)
 
-    private fun execRootScript(script: String, timeoutSeconds: Long): ShellResult {
+    private fun execRootScript(
+        script: String,
+        timeoutSeconds: Long,
+        onOutput: ((String) -> Unit)? = null
+    ): ShellResult {
+        val output = rootOutputList(onOutput)
         val result = Shell.Builder.create()
             .setFlags(Shell.FLAG_MOUNT_MASTER or Shell.FLAG_REDIRECT_STDERR)
             .setTimeout(timeoutSeconds)
             .build()
             .newJob()
+            .to(output, output)
             .add(script)
             .exec()
-        val output = result.out + result.err
-        return ShellResult(
-            result.isSuccess,
-            output.ifEmpty {
-                listOf(
-                    if (result.isSuccess) "[ABK] Root 命令执行完成，但命令未返回输出。"
-                    else "[ABK] Root 命令执行失败，但命令未返回输出。"
-                )
+        return ShellResult(result.isSuccess, normalizedOutput(result.isSuccess, output, onOutput))
+    }
+
+    private fun rootOutputList(onOutput: ((String) -> Unit)?): MutableList<String> {
+        val output = Collections.synchronizedList(mutableListOf<String>())
+        return if (onOutput == null) {
+            output
+        } else {
+            object : CallbackList<String>(output) {
+                override fun onAddElement(element: String) {
+                    onOutput(element)
+                }
             }
-        )
+        }
+    }
+
+    private fun normalizedOutput(
+        success: Boolean,
+        output: List<String>,
+        onOutput: ((String) -> Unit)?
+    ): List<String> {
+        if (output.isNotEmpty()) return output.toList()
+        val fallback = if (success) {
+            "[ABK] Root 命令执行完成，但命令未返回输出。"
+        } else {
+            "[ABK] Root 命令执行失败，但命令未返回输出。"
+        }
+        onOutput?.invoke(fallback)
+        return listOf(fallback)
     }
 
     private fun shellQuote(value: String): String = "'${value.replace("'", "'\"'\"'")}'"

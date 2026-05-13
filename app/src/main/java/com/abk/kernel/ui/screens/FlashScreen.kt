@@ -269,17 +269,52 @@ fun FlashScreen(
         Toast.makeText(context, "已复制文件路径", Toast.LENGTH_SHORT).show()
     }
 
+    fun appendTerminalOutput(line: String) {
+        scope.launch(Dispatchers.Main.immediate) {
+            terminalLog = terminalLog + line
+        }
+    }
+
     fun installManager(item: DownloadedArtifact) {
-        val ok = DownloadUtils.installApk(context, item.filePath)
-        if (!ok) {
+        if (!rootGranted) {
             showFailure(
-                "无法安装 APK",
+                "Root 未授权",
                 listOf(
-                    "${'$'} install ${item.filePath}",
-                    "系统 APK 安装器不可用，或当前 ROM 阻止了外部 APK 安装请求。",
-                    "文件: ${item.name}"
+                    "${'$'} pm install -r ${item.name}",
+                    "当前处于部分激活状态，文件页只允许查看已下载文件。",
+                    "如需直接安装管理器应用，请先授予 Root 权限。"
                 )
             )
+            return
+        }
+        terminalTitle = "安装管理器 APK"
+        terminalCanReboot = false
+        terminalRunning = true
+        terminalSuccess = null
+        terminalLog = listOf(
+            "${'$'} pm install -r ${item.name}",
+            "file: ${item.filePath}",
+            "",
+            "等待 root shell 返回，请不要退出应用..."
+        )
+        showTerminal = true
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    RootUtils.installApk(context, item.filePath, ::appendTerminalOutput)
+                }.getOrElse { error ->
+                    RootUtils.ShellResult(false, listOf(error.message ?: error::class.java.simpleName))
+                }
+            }
+            terminalRunning = false
+            terminalSuccess = result.success
+            terminalLog = listOf(
+                "${'$'} pm install -r ${item.name}",
+                "file: ${item.filePath}",
+                ""
+            ) + result.output.ifEmpty {
+                listOf(if (result.success) "命令执行完成，无输出。" else "命令执行失败，但未返回日志。")
+            }
         }
     }
 
@@ -310,10 +345,10 @@ fun FlashScreen(
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     when (item.type) {
-                        ArtifactType.KERNEL_IMG -> RootUtils.flashImage(item.filePath)
-                        ArtifactType.ANYKERNEL3 -> RootUtils.flashAnyKernel3(context, item.filePath)
-                        ArtifactType.SUSFS_MODULE -> RootUtils.installModule(item.filePath)
-                        ArtifactType.KSU_MANAGER -> RootUtils.ShellResult(false, listOf("APK 请通过系统安装器安装"))
+                        ArtifactType.KERNEL_IMG -> RootUtils.flashImage(item.filePath, onOutput = ::appendTerminalOutput)
+                        ArtifactType.ANYKERNEL3 -> RootUtils.flashAnyKernel3(context, item.filePath, ::appendTerminalOutput)
+                        ArtifactType.SUSFS_MODULE -> RootUtils.installModule(item.filePath, ::appendTerminalOutput)
+                        ArtifactType.KSU_MANAGER -> RootUtils.installApk(context, item.filePath, ::appendTerminalOutput)
                         else -> RootUtils.ShellResult(false, listOf("不支持此文件类型的自动刷写"))
                     }
                 }.getOrElse { error ->
@@ -2141,6 +2176,9 @@ private fun FlashTerminalDialog(
     }
     val terminalTextColor = colorScheme.onSurface
     val terminalCommandColor = colorScheme.primary
+    LaunchedEffect(logLines.size) {
+        terminalScroll.animateScrollTo(terminalScroll.maxValue)
+    }
     AlertDialog(
         onDismissRequest = { if (!running) onClose() },
         icon = {

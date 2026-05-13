@@ -700,24 +700,27 @@ jobs:
         run: |
           branch_input="${{ inputs.ksu_branch }}"
           variant_input="${{ inputs.ksu_variant }}"
+          KSU_OFFICIAL_COMMIT="3f388ef137c78e1ca0c92c0ada3b8717cdcc4302"
+          SUKISU_COMMIT="6a316b122eb3ee6a03203d6e7241a8437dd17e1c"
+          RESUKISU_COMMIT="0d096be05c40338205bc183f5ec072233e15f9c0"
 
-          if [ "$variant_input" = "ReSukiSU" ]; then
-            BRANCH="-s main"
+          if [ "$variant_input" = "Official" ]; then
+            BRANCH="-s $KSU_OFFICIAL_COMMIT"
+          elif [ "$variant_input" = "SukiSU" ]; then
+            BRANCH="-s $SUKISU_COMMIT"
+          elif [ "$variant_input" = "ReSukiSU" ]; then
+            BRANCH="$RESUKISU_COMMIT"
           else
             case "$branch_input" in
               "Stable(标准)")
                 case "$variant_input" in
                   "Next") ;;
-                  "SukiSU") BRANCH="-s builtin" ;;
-                  "Official") BRANCH="-s main" ;;
                   *) BRANCH="-" ;;
                 esac
                 ;;
               "Dev(开发)")
                 case "$variant_input" in
-                  "Official") BRANCH="-s main" ;;
                   "Next") ;;
-                  "SukiSU") BRANCH="-s builtin" ;;
                   *) echo "未知变体: $variant_input" >&2; exit 1 ;;
                 esac
                 ;;
@@ -727,23 +730,6 @@ jobs:
                 ;;
             esac
 
-            # SukiSU 不启用 SUSFS 时强制使用 main 分支
-            if [ "$variant_input" = "SukiSU" ] && [ "${{ inputs.enable_susfs }}" = "false" ]; then
-              BRANCH="-s main"
-            fi
-          fi
-
-          # 检查自定义提交 (仅对 SukiSU 生效)
-          CONFIG_FILE="config/config"
-          if [ -f "$CONFIG_FILE" ]; then
-            CUSTOM_ENABLED=$(grep "^custom=" "$CONFIG_FILE" | cut -d'=' -f2)
-            if [ "$CUSTOM_ENABLED" == "true" ] && [ "$variant_input" == "SukiSU" ]; then
-              SUKISU_COMMIT=$(grep "^sukisu=" "$CONFIG_FILE" | cut -d'=' -f2)
-              if [ -n "$SUKISU_COMMIT" ]; then
-                BRANCH="-s $SUKISU_COMMIT"
-                echo "SukiSU 使用自定义提交: $SUKISU_COMMIT"
-              fi
-            fi
           fi
 
           echo "BRANCH=$BRANCH" >> $GITHUB_ENV
@@ -778,7 +764,7 @@ jobs:
               ;;
             "ReSukiSU")
               echo "添加 ReSukiSU..."
-              curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash $BRANCH
+              curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "$BRANCH"
               ;;
           esac
 
@@ -789,17 +775,11 @@ jobs:
             echo "KSU_LATEST_COMMIT_DATE=未知" >> $GITHUB_ENV
           fi
 
-      - name: 修复 SukiSU/ReSukiSU SUSFS 源码兼容
-        if: (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'ReSukiSU') && inputs.enable_susfs && inputs.ksu_variant != 'None'
+      - name: 修复 ReSukiSU SUSFS 源码兼容
+        if: inputs.ksu_variant == 'ReSukiSU' && inputs.enable_susfs && inputs.ksu_variant != 'None'
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
           set -euo pipefail
-
-          KSU_C="KernelSU/kernel/ksu.c"
-          if [ ! -f "$KSU_C" ]; then
-            echo "::error::未找到 $KSU_C，无法应用 SukiSU/ReSukiSU SUSFS 兼容修复"
-            exit 1
-          fi
 
           python3 - <<'PY'
           from pathlib import Path
@@ -815,81 +795,162 @@ jobs:
                       closes += 1
               return opens - closes
 
-          kernel_dir = Path("KernelSU/kernel")
-          ksu_c = kernel_dir / "ksu.c"
-          tree_text = "\n".join(
-              path.read_text(errors="ignore")
-              for path in kernel_dir.rglob("*")
-              if path.is_file()
-          )
+          variant = "${{ inputs.ksu_variant }}"
+          candidates = []
+          seen = set()
+          roots = [Path("KernelSU/kernel")]
+          if variant == "ReSukiSU":
+              roots.extend([Path("common/drivers/kernelsu"), Path("drivers/kernelsu")])
 
-          true_symbols = [
-              "ksu_is_init_rc_hook_enabled",
-              "ksu_is_input_hook_enabled",
-          ]
-          false_symbols = [
-              "ksu_init_rc_hook_key_false",
-              "ksu_input_hook_key_false",
-          ]
+          for base in roots:
+              resolved = base.resolve()
+              if resolved in seen:
+                  continue
+              if variant == "ReSukiSU":
+                  markers = ["Kbuild", "core/init.c", "feature/sucompat.c", "sulog/event.c"]
+                  if any((base / marker).exists() for marker in markers):
+                      candidates.append(base)
+                      seen.add(resolved)
+              elif (base / "ksu.c").exists():
+                  candidates.append(base)
+                  seen.add(resolved)
 
-          missing_true = [
-              sym for sym in true_symbols
-              if f"DEFINE_STATIC_KEY_TRUE({sym}" not in tree_text
-          ]
-          missing_false = [
-              sym for sym in false_symbols
-              if f"DEFINE_STATIC_KEY_FALSE({sym}" not in tree_text
-          ]
+          if not candidates:
+              if variant == "ReSukiSU":
+                  raise SystemExit("未找到实际 ReSukiSU 源码目录，无法应用 SUSFS 兼容修复")
+              raise SystemExit("未找到 KernelSU/kernel/ksu.c，无法应用 SukiSU/ReSukiSU SUSFS 兼容修复")
 
-          if not missing_true and not missing_false:
-              print("SukiSU/ReSukiSU SUSFS static key definitions already exist.")
-          else:
-              text = ksu_c.read_text()
-              anchor = '#include "infra/kernel_compat.h"\n'
-              if anchor not in text:
-                  raise SystemExit("kernel_compat.h include anchor not found in KernelSU/kernel/ksu.c")
+          for kernel_dir in candidates:
+              print(f"检查 SukiSU/ReSukiSU SUSFS 源码目录: {kernel_dir}")
+              ksu_c = kernel_dir / "ksu.c"
+              tree_text = "\n".join(
+                  path.read_text(errors="ignore")
+                  for path in kernel_dir.rglob("*")
+                  if path.is_file()
+              )
 
-              block = [
-                  "",
-                  "/* ABK: SukiSU/ReSukiSU builtin SUSFS expects these inline hook static keys. */",
-                  "#ifdef CONFIG_KSU_SUSFS",
+              true_symbols = [
+                  "ksu_is_init_rc_hook_enabled",
+                  "ksu_is_input_hook_enabled",
               ]
-              block.extend(f"DEFINE_STATIC_KEY_TRUE({sym});" for sym in missing_true)
-              if missing_false:
-                  block.append("#if defined(KSU_COMPAT_USE_STATIC_KEY)")
-                  block.extend(f"DEFINE_STATIC_KEY_FALSE({sym});" for sym in missing_false)
-                  block.append("#endif")
-              block.extend(["#endif", ""])
+              false_symbols = [
+                  "ksu_init_rc_hook_key_false",
+                  "ksu_input_hook_key_false",
+              ]
 
-              ksu_c.write_text(text.replace(anchor, anchor + "\n".join(block), 1))
-              print("Injected missing SukiSU/ReSukiSU SUSFS static key definitions:", ", ".join(missing_true + missing_false))
+              missing_true = [
+                  sym for sym in true_symbols
+                  if f"DEFINE_STATIC_KEY_TRUE({sym}" not in tree_text
+              ]
+              missing_false = [
+                  sym for sym in false_symbols
+                  if f"DEFINE_STATIC_KEY_FALSE({sym}" not in tree_text
+              ]
 
-          sucompat_c = kernel_dir / "feature/sucompat.c"
-          if sucompat_c.exists():
-              text = sucompat_c.read_text()
-              marker = "\n// dead code\n"
-              guard = "#endif /* CONFIG_KSU_SUSFS */\n"
-              if marker in text and guard not in text:
-                  before_marker = text.split(marker, 1)[0]
-                  if preprocessor_delta(before_marker) > 0:
-                      sucompat_c.write_text(text.replace(marker, "\n" + guard + marker, 1))
-                      print("Closed missing SukiSU/ReSukiSU builtin CONFIG_KSU_SUSFS block in feature/sucompat.c")
+              if not missing_true and not missing_false:
+                  print("SukiSU/ReSukiSU SUSFS static key definitions already exist.")
+              else:
+                  if not ksu_c.exists():
+                      print(f"  {kernel_dir} 未提供 ksu.c，跳过 static key 注入")
+                      text = ""
+                  else:
+                      text = ksu_c.read_text()
+                  anchor = '#include "infra/kernel_compat.h"\n'
+                  if ksu_c.exists() and anchor not in text:
+                      if variant == "ReSukiSU":
+                          print(f"  {ksu_c} 未找到 kernel_compat.h include anchor，跳过 static key 注入")
+                          continue
+                      raise SystemExit("kernel_compat.h include anchor not found in KernelSU/kernel/ksu.c")
+                  elif ksu_c.exists():
+                      block = [
+                          "",
+                          "/* ABK: SukiSU/ReSukiSU builtin SUSFS expects these inline hook static keys. */",
+                          "#ifdef CONFIG_KSU_SUSFS",
+                      ]
+                      block.extend(f"DEFINE_STATIC_KEY_TRUE({sym});" for sym in missing_true)
+                      if missing_false:
+                          block.append("#if defined(KSU_COMPAT_USE_STATIC_KEY)")
+                          block.extend(f"DEFINE_STATIC_KEY_FALSE({sym});" for sym in missing_false)
+                          block.append("#endif")
+                      block.extend(["#endif", ""])
 
-          sulog_event_c = kernel_dir / "sulog/event.c"
-          if sulog_event_c.exists():
-              text = sulog_event_c.read_text()
-              old = "    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, USER_ARG_NULL, gfp);"
-              new = "\n".join([
-                  "    /* ABK: builtin SUSFS ksu_sulog_capture() expects argv_user as a pointer. */",
-                  "#ifdef CONFIG_KSU_SUSFS",
-                  "    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, NULL, gfp);",
-                  "#else",
-                  "    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, USER_ARG_NULL, gfp);",
-                  "#endif",
-              ])
-              if old in text and "builtin SUSFS ksu_sulog_capture()" not in text:
-                  sulog_event_c.write_text(text.replace(old, new, 1))
-                  print("Fixed SukiSU/ReSukiSU builtin sulog grant_root argv type for CONFIG_KSU_SUSFS")
+                      ksu_c.write_text(text.replace(anchor, anchor + "\n".join(block), 1))
+                      print("Injected missing SukiSU/ReSukiSU SUSFS static key definitions:", ", ".join(missing_true + missing_false))
+
+              if variant == "ReSukiSU":
+                  selinux_c = kernel_dir / "selinux/selinux.c"
+                  if selinux_c.exists():
+                      text = selinux_c.read_text()
+                      compat_symbols = [
+                          "ksu_selinux_hide_running",
+                          "struct selinux_state fake_state",
+                          "struct selinux_policy *backup_sepolicy",
+                          "security_context_to_sid_with_policy",
+                          "security_sid_to_context_with_policy",
+                          "security_compute_av_user_with_policy",
+                      ]
+                      if not all(symbol in tree_text for symbol in compat_symbols):
+                          anchor = "u32 ksu_file_sid __read_mostly = 0;\n"
+                          block = "\n".join([
+                              "",
+                              "/* ABK: simonpunk SUSFS SELinux hooks reference KernelSU selinux_hide globals. */",
+                              "#ifdef CONFIG_KSU_SUSFS",
+                              "struct selinux_state fake_state;",
+                              "bool ksu_selinux_hide_running __read_mostly = false;",
+                              "struct selinux_policy *backup_sepolicy;",
+                              "#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)",
+                              "int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,",
+                              "                                        u32 *sid, u32 def_sid, unsigned int gfp_flags)",
+                              "{",
+                              "    return -22;",
+                              "}",
+                              "int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,",
+                              "                                        u32 *scontext_len)",
+                              "{",
+                              "    return -22;",
+                              "}",
+                              "void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,",
+                              "                                          struct av_decision *avd)",
+                              "{",
+                              "}",
+                              "#endif",
+                              "#endif",
+                              "",
+                          ])
+                          if anchor in text:
+                              selinux_c.write_text(text.replace(anchor, anchor + block, 1))
+                          elif '#include "selinux_defs.h"\n' in text:
+                              selinux_c.write_text(text.replace('#include "selinux_defs.h"\n', '#include "selinux_defs.h"\n' + block, 1))
+                          else:
+                              raise SystemExit(f"{selinux_c} missing SELinux compatibility insertion anchor")
+                          print("Injected ReSukiSU SUSFS SELinux hide compatibility globals")
+
+              sucompat_c = kernel_dir / "feature/sucompat.c"
+              if sucompat_c.exists():
+                  text = sucompat_c.read_text()
+                  marker = "\n// dead code\n"
+                  guard = "#endif /* CONFIG_KSU_SUSFS */\n"
+                  if marker in text and guard not in text:
+                      before_marker = text.split(marker, 1)[0]
+                      if preprocessor_delta(before_marker) > 0:
+                          sucompat_c.write_text(text.replace(marker, "\n" + guard + marker, 1))
+                          print("Closed missing SukiSU/ReSukiSU builtin CONFIG_KSU_SUSFS block in feature/sucompat.c")
+
+              sulog_event_c = kernel_dir / "sulog/event.c"
+              if sulog_event_c.exists():
+                  text = sulog_event_c.read_text()
+                  old = "    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, USER_ARG_NULL, gfp);"
+                  new = "\n".join([
+                      "    /* ABK: builtin SUSFS ksu_sulog_capture() expects argv_user as a pointer. */",
+                      "#ifdef CONFIG_KSU_SUSFS",
+                      "    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, NULL, gfp);",
+                      "#else",
+                      "    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, USER_ARG_NULL, gfp);",
+                      "#endif",
+                  ])
+                  if old in text and "builtin SUSFS ksu_sulog_capture()" not in text:
+                      sulog_event_c.write_text(text.replace(old, new, 1))
+                      print("Fixed SukiSU/ReSukiSU builtin sulog grant_root argv type for CONFIG_KSU_SUSFS")
           PY
 
       - name: 配置 SukiSU 管理器信息
@@ -978,8 +1039,11 @@ jobs:
 
               cd ..
               ;;
-            "Next"|"SukiSU"|"ReSukiSU")
-              echo "Next/SukiSU/ReSukiSU 使用内置 SUSFS 支持"
+            "Next"|"ReSukiSU")
+              echo "Next/ReSukiSU 使用内置 SUSFS 支持"
+              ;;
+            "SukiSU")
+              echo "SukiSU 跳过 SUSFS Kconfig，仅保留按版本收窄的源码兼容处理"
               ;;
           esac
 
@@ -1126,6 +1190,75 @@ jobs:
               fi
             }
 
+            fix_sukisu_fdinfo_mask_decl() {
+              if [ "${{ inputs.ksu_variant }}" != "SukiSU" ]; then
+                return 0
+              fi
+
+              local file="./fs/notify/fdinfo.c"
+              [ -f "$file" ] || return 0
+
+              python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("./fs/notify/fdinfo.c")
+          lines = path.read_text().splitlines(keepends=True)
+
+          start = None
+          for index, line in enumerate(lines):
+              if re.match(r"\s*static\s+void\s+inotify_fdinfo\s*\(", line):
+                  start = index
+                  break
+
+          if start is None:
+              raise SystemExit(0)
+
+          brace_line = None
+          for index in range(start, len(lines)):
+              if "{" in lines[index]:
+                  brace_line = index
+                  break
+
+          if brace_line is None:
+              raise SystemExit(0)
+
+          depth = 0
+          end = None
+          for index in range(brace_line, len(lines)):
+              depth += lines[index].count("{")
+              depth -= lines[index].count("}")
+              if index > brace_line and depth <= 0:
+                  end = index
+                  break
+
+          if end is None:
+              raise SystemExit(0)
+
+          body = "".join(lines[brace_line + 1:end])
+          if "mask, mark->ignored_mask" not in body:
+              raise SystemExit(0)
+
+          decl_re = re.compile(r"^\s*u32\s+mask\s*(?:=\s*mark->mask\s*&\s*IN_ALL_EVENTS)?\s*;\s*(?:/\*.*\*/\s*)?$")
+          new_body = [
+              line for line in lines[brace_line + 1:end]
+              if not decl_re.match(line)
+          ]
+          new_lines = (
+              lines[:brace_line + 1]
+              + ["\tu32 mask = mark->mask & IN_ALL_EVENTS;\n"]
+              + new_body
+              + lines[end:]
+          )
+
+          if new_lines != lines:
+              path.write_text("".join(new_lines))
+              print("已修复 SukiSU fdinfo.c 中 mask 声明作用域")
+          else:
+              print("SukiSU fdinfo.c mask 声明无需修改")
+          PY
+            }
+
             # Android 12 - 5.10 修复
             if [[ "${{ inputs.android_version }}" == "android12" && "${{ inputs.kernel_version }}" == "5.10" ]]; then
               if [[ "$CURRENT_SUB" -le 209 ]]; then
@@ -1134,10 +1267,17 @@ jobs:
               if [[ "$CURRENT_SUB" -le 117 ]]; then
                 cp $KERNEL_PATCHES/wild/susfs_fix_patches/v${SUSFS_VERSION}/a12-5.10/fdinfo.c.patch ./
                 patch -p1 < fdinfo.c.patch || true
+                fix_sukisu_fdinfo_mask_decl
               fi
               if [[ "$CURRENT_SUB" -le 43 ]]; then
                 cp $KERNEL_PATCHES/wild/susfs_fix_patches/v${SUSFS_VERSION}/a12-5.10/base.c.patch ./
                 patch -p1 < base.c.patch || true
+                if [[ "${{ inputs.ksu_variant }}" == "SukiSU" && "${{ inputs.use_bbg }}" == "true" ]]; then
+                  fix_proc_base_missing_vma_decl
+                fi
+                if [[ "${{ inputs.ksu_variant }}" == "Official" && "${{ inputs.use_bbg }}" == "true" && "$CURRENT_SUB" -eq 43 ]]; then
+                  fix_proc_base_missing_vma_decl
+                fi
                 if [[ "${{ inputs.ksu_variant }}" == "ReSukiSU" && "$CURRENT_SUB" -eq 43 ]]; then
                   fix_proc_base_missing_vma_decl
                 fi
@@ -1177,6 +1317,7 @@ jobs:
                 fi
                 cp $KERNEL_PATCHES/wild/susfs_fix_patches/v${SUSFS_VERSION}/a13-5.15/fdinfo.c.patch ./
                 patch -p1 < fdinfo.c.patch || true
+                fix_sukisu_fdinfo_mask_decl
                 cp $KERNEL_PATCHES/wild/susfs_fix_patches/v${SUSFS_VERSION}/a13-5.15/open.c.patch ./
                 patch -p1 < open.c.patch || true
               fi
@@ -1262,16 +1403,30 @@ jobs:
       - name: 应用 Kernel 特定补丁
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
-          # 修复 android15-6.6 2024-11: mmap.c 调用了 vm_flags_clear()，但同分支 mm.h 未提供 helper
-          if [[ "${{ inputs.android_version }}" == "android15" && "${{ inputs.kernel_version }}" == "6.6" && "${{ inputs.os_patch_level }}" == "2024-11" ]] \
+          # 修复指定 2024-11 分支: mmap.c 调用了 vm_flags_clear()，但同分支 mm.h 未提供 helper
+          if [[ "${{ inputs.os_patch_level }}" == "2024-11" ]] \
+            && { [[ "${{ inputs.android_version }}" == "android12" && "${{ inputs.kernel_version }}" == "5.10" && "${{ inputs.sub_level }}" == "226" ]] \
+              || [[ "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.15" && "${{ inputs.sub_level }}" == "167" ]] \
+              || [[ "${{ inputs.android_version }}" == "android15" && "${{ inputs.kernel_version }}" == "6.6" ]]; } \
             && grep -qF 'vm_flags_clear(new_vma, VM_PAD_MASK);' ./mm/mmap.c \
             && ! grep -qF 'static inline void vm_flags_clear(' ./include/linux/mm.h; then
-            python3 - <<'PY'
+            python3 - "${{ inputs.kernel_version }}" <<'PY'
+          import sys
           from pathlib import Path
 
+          kernel_version = sys.argv[1]
           path = Path("include/linux/mm.h")
           text = path.read_text()
-          helper = """
+          if kernel_version in {"5.10", "5.15"}:
+              helper = """
+          static inline void vm_flags_clear(struct vm_area_struct *vma,
+                                            vm_flags_t flags)
+          {
+              vma->vm_flags &= ~flags;
+          }
+          """
+          else:
+              helper = """
           static inline void vm_flags_clear(struct vm_area_struct *vma,
                                             vm_flags_t flags)
           {
@@ -1287,17 +1442,22 @@ jobs:
               else:
                   needle = "static inline void vm_flags_set(struct vm_area_struct *vma,"
                   start = text.find(needle)
-                  if start == -1:
-                      raise SystemExit("include/linux/mm.h missing vm_flags_set(), cannot inject vm_flags_clear()")
-                  body_start = text.find("{", start)
-                  body_end = text.find("\n}\n", body_start)
-                  if body_start == -1 or body_end == -1:
-                      raise SystemExit("include/linux/mm.h vm_flags_set() has unexpected format")
-                  insert_at = body_end + len("\n}\n")
+                  if start != -1:
+                      body_start = text.find("{", start)
+                      body_end = text.find("\n}\n", body_start)
+                      if body_start == -1 or body_end == -1:
+                          raise SystemExit("include/linux/mm.h vm_flags_set() has unexpected format")
+                      insert_at = body_end + len("\n}\n")
+                  elif "#endif /* _LINUX_MM_H */" in text:
+                      insert_at = text.rfind("#endif /* _LINUX_MM_H */")
+                  elif "#endif" in text:
+                      insert_at = text.rfind("#endif")
+                  else:
+                      raise SystemExit("include/linux/mm.h missing insertion anchor for vm_flags_clear()")
                   text = text[:insert_at] + helper + text[insert_at:]
               path.write_text(text)
           PY
-            echo "已为 android15-6.6 2024-11 补充 vm_flags_clear helper"
+            echo "已为 ${{ inputs.android_version }}-${{ inputs.kernel_version }} 2024-11 补充 vm_flags_clear helper"
           fi
 
       - name: 备份基准 defconfig
@@ -1766,11 +1926,9 @@ jobs:
           wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
           BBG_MAKEFILE="Baseband-guard/Makefile"
           if { { [ "${{ inputs.android_version }}" = "android12" ] && \
-                 [ "${{ inputs.kernel_version }}" = "5.10" ] && \
-                 [ "${{ inputs.sub_level }}" = "43" ]; } || \
+                 [ "${{ inputs.kernel_version }}" = "5.10" ]; } || \
                { [ "${{ inputs.android_version }}" = "android13" ] && \
-                 [ "${{ inputs.kernel_version }}" = "5.15" ] && \
-                 [ "${{ inputs.sub_level }}" = "41" ]; }; } && \
+                 [ "${{ inputs.kernel_version }}" = "5.15" ]; }; } && \
              [ -f "$BBG_MAKEFILE" ]; then
             echo "应用 BBG legacy host header 生成兼容修复: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}"
             python3 - "$BBG_MAKEFILE" "common/security/selinux" <<'PY'
@@ -2057,6 +2215,11 @@ jobs:
       - name: 添加 SUSFS 配置
         if: inputs.enable_susfs && inputs.ksu_variant != 'None'
         run: |
+          if [ "${{ inputs.ksu_variant }}" == "SukiSU" ]; then
+            echo "::warning::SukiSU 固定源码缺少完整 SUSFS 导出符号，跳过 CONFIG_KSU_SUSFS* 写入以避免链接失败"
+            exit 0
+          fi
+
           cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
