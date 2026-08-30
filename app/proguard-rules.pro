@@ -3,9 +3,26 @@
 -keepattributes *Annotation*
 -keep class com.abk.kernel.data.model.** { *; }
 
+# Signed bundle manifests are deserialized reflectively by Gson. Keep the
+# concrete DTOs and their generic field signatures in minified release builds.
+-keep class com.abk.kernel.utils.SignedBundleManifest { *; }
+-keep class com.abk.kernel.utils.KernelSourceManifest { *; }
+-keep class com.abk.kernel.utils.FeatureStatusManifest { *; }
+-keep class com.abk.kernel.utils.SkippedFeatureManifest { *; }
+-keep class com.abk.kernel.utils.ClientNoticeManifest { *; }
+
 # libsu uses reflection internally.
 -keep class com.topjohnwu.superuser.** { *; }
 -dontwarn com.topjohnwu.superuser.**
+
+# Native KernelSU bridge resolves this class and profile fields by JNI name.
+-keep class com.abk.kernel.utils.AbkKsuNative { *; }
+-keep class com.abk.kernel.utils.AbkKsuNative$Profile { *; }
+
+# Module WebUI JavaScript bridge methods are called by name from WebView.
+-keepclassmembers class com.abk.kernel.ui.webui.ModuleWebUiActivity$ModuleWebBridge {
+    @android.webkit.JavascriptInterface <methods>;
+}
 
 # WorkManager initializes its Room database through reflection during app startup.
 # Keep the generated database and DAO implementations intact in minified release builds.
